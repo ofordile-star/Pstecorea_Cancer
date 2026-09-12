@@ -1,0 +1,232 @@
+"""
+06_covariate_scan.py
+
+Implements the income/development-adjusted robustness analyses described
+in the manuscript's Methods and Supplementary Note S1, but that were not
+present in any of the previously deposited scripts (01-05):
+
+  - Table S3 rows: median age only, smoking only, age+smoking, GDP per
+    capita (log) only, age+smoking+GDP -- PLUS the HDI-only adjustment
+    that Note S1's text says is "reported... in Supplementary Table S3"
+    but which the table as currently drafted does not actually contain.
+    ACTION NEEDED: add the HDI-only row this script produces to Table S3,
+    or adjust the text in Note S1 so it no longer claims HDI results are
+    in a table that doesn't have them.
+
+  - The genus-level HDI-adjusted partial correlations quoted in Note S1
+    for Prevotella (r=-0.114, p=0.516), Megasphaera (r=-0.309, p=0.071),
+    and Collinsella (r=-0.377, p=0.026), plus the full 50-genus scan for
+    completeness (a Table-S4-style HDI column).
+
+  - E-values via the exact formula given in Methods: RR = exp(0.91*|r|);
+    E = RR + sqrt(RR*(RR-1)) for RR>1 (or the same transform of 1/RR for
+    RR<1).
+
+INPUTS:
+    country_prevotella_summary.csv   (output of 01_prep_prevotella_data.py)
+    genus_country_pct.csv            (output of 04_genus_scan.py)
+    ci5_country_period_avg.csv       (output of 02_prep_cancer_data.py --
+                                       must be the bugfixed version; see
+                                       that script's docstring)
+    owid-covid-latest.csv            (as in 04_genus_scan.py: median_age,
+                                       female_smokers, male_smokers)
+
+    HDI and GDP per capita are fetched directly from Our World in Data's
+    stable grapher CSV API at run time (no manual download step -- these
+    are small, versioned reference tables, unlike the sequencing data):
+        https://ourworldindata.org/grapher/human-development-index.csv
+        https://ourworldindata.org/grapher/gdp-per-capita-worldbank.csv
+    Both ultimately reprocess UNDP's Human Development Report and the
+    World Bank's International Comparison Program PPP series respectively
+    -- the sources named in the manuscript's Methods. For an offline run,
+    download each URL once and point HDI_FILE / GDP_FILE at the local
+    copy instead.
+
+OUTPUT:
+    table_s3_full.csv       -- adjustment, partial_r, p, n, e_value
+    genus_hdi_scan.csv      -- genus, n, r_raw, p_raw, r_hdi_adj, p_hdi_adj
+"""
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from scipy import stats
+
+HDI_URL = "https://ourworldindata.org/grapher/human-development-index.csv?v=1&csvType=full&useColumnShortNames=false"
+GDP_URL = "https://ourworldindata.org/grapher/gdp-per-capita-worldbank.csv?v=1&csvType=full&useColumnShortNames=false"
+HDI_FILE = None  # set to a local path to use an offline copy instead of HDI_URL
+GDP_FILE = None  # set to a local path to use an offline copy instead of GDP_URL
+HDI_YEAR = 2023   # matches manuscript Methods: "most recent available year, 2023"
+
+PREVOTELLA_SUMMARY = "country_prevotella_summary.csv"
+GENUS_COUNTRY_PCT = "genus_country_pct.csv"
+CI5_FILE = "ci5_country_period_avg.csv"
+COVARIATES_FILE = "owid-covid-latest.csv"
+
+
+# ---------------------------------------------------------------------------
+# Covariate loading
+# ---------------------------------------------------------------------------
+def load_latest_indicator(url_or_path, value_col, year=None):
+    """Load an OWID grapher CSV (Entity, Code, Year, <value_col>, region)
+    and return {iso3: value} using the most recent year available per
+    country up to `year` (or exactly `year` if it must match Methods'
+    stated vintage)."""
+    read_kwargs = {}
+    if isinstance(url_or_path, str) and url_or_path.startswith('http'):
+        # Some environments reject default-urllib requests; OWID's own
+        # docs recommend setting a User-Agent.
+        read_kwargs['storage_options'] = {'User-Agent': 'Pstercorea-Cancer-Repro/1.0'}
+    df = pd.read_csv(url_or_path, **read_kwargs)
+    df = df.dropna(subset=['Code', value_col])
+    df = df[df['Code'].str.len() == 3]  # drop OWID aggregate rows (no ISO3)
+    if year is not None:
+        df = df[df['Year'] == year]
+    else:
+        df = df.sort_values('Year').groupby('Code').tail(1)
+    return dict(zip(df['Code'], df[value_col]))
+
+
+def load_hdi():
+    src = HDI_FILE if HDI_FILE else HDI_URL
+    return load_latest_indicator(src, 'Human Development Index', year=HDI_YEAR)
+
+
+def load_gdp():
+    src = GDP_FILE if GDP_FILE else GDP_URL
+    # No fixed year specified for GDP in Methods ("most recent available
+    # year") -- take each country's latest.
+    return load_latest_indicator(src, 'GDP per capita', year=None)
+
+
+# ---------------------------------------------------------------------------
+# Stats helpers
+# ---------------------------------------------------------------------------
+def partial_corr(x, y, z=None):
+    """Residual-method partial correlation, matching Methods: regress x
+    and y separately (OLS) on covariate set z, correlate the residuals.
+    If z is None, this is just the raw Pearson correlation."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if z is None or (hasattr(z, 'shape') and z.shape[1] == 0):
+        return stats.pearsonr(x, y)
+    z = np.asarray(z, dtype=float)
+    if z.ndim == 1:
+        z = z.reshape(-1, 1)
+    Xz = sm.add_constant(z)
+    rx = sm.OLS(x, Xz).fit().resid
+    ry = sm.OLS(y, Xz).fit().resid
+    return stats.pearsonr(rx, ry)
+
+
+def e_value(r):
+    """VanderWeele & Ding (2017) E-value, per manuscript Methods:
+    RR = exp(0.91*|r|); E = RR + sqrt(RR*(RR-1)) for RR>1, else the same
+    transform applied to 1/RR."""
+    rr = np.exp(0.91 * abs(r))
+    if rr > 1:
+        return rr + np.sqrt(rr * (rr - 1))
+    inv = 1.0 / rr
+    return inv + np.sqrt(inv * (inv - 1))
+
+
+# ---------------------------------------------------------------------------
+# Table S3: main Prevotella-cancer association, single- and multi-covariate
+# adjustment (including the HDI-only row Note S1 says exists but Table S3
+# currently lacks)
+# ---------------------------------------------------------------------------
+def build_table_s3():
+    prev = pd.read_csv(PREVOTELLA_SUMMARY)
+    prev = prev[prev['n_samples'] >= 20].copy()
+    import pycountry
+    prev['iso3'] = prev['iso'].apply(
+        lambda a2: (pycountry.countries.get(alpha_2=a2).alpha_3 if pycountry.countries.get(alpha_2=a2) else None))
+
+    ci5 = pd.read_csv(CI5_FILE)
+    covars = pd.read_csv(COVARIATES_FILE)[['iso_code', 'median_age', 'female_smokers', 'male_smokers']].rename(
+        columns={'iso_code': 'iso3'})
+    covars['smoking_avg'] = covars[['female_smokers', 'male_smokers']].mean(axis=1)
+
+    hdi = load_hdi()
+    gdp = load_gdp()
+
+    df = prev.merge(ci5[['iso3', 'ASR_period_avg']], on='iso3', how='inner')
+    df = df.merge(covars[['iso3', 'median_age', 'smoking_avg']], on='iso3', how='left')
+    df['hdi'] = df['iso3'].map(hdi)
+    df['log_gdp'] = df['iso3'].map(gdp).apply(lambda v: np.log(v) if pd.notna(v) else np.nan)
+
+    x_col, y_col = 'pct_prevotella_gt1', 'ASR_period_avg'
+
+    rows = []
+
+    def add_row(label, covariate_cols, with_evalue):
+        sub = df.dropna(subset=[x_col, y_col] + covariate_cols)
+        z = sub[covariate_cols].values if covariate_cols else None
+        r, p = partial_corr(sub[x_col], sub[y_col], z)
+        rows.append({
+            'adjustment': label,
+            'partial_r': round(r, 3),
+            'p': p,
+            'n': len(sub),
+            'e_value': round(e_value(r), 2) if with_evalue else None,
+        })
+
+    add_row('None (raw)', [], with_evalue=True)
+    add_row('Median age only', ['median_age'], with_evalue=False)
+    add_row('Smoking prevalence only', ['smoking_avg'], with_evalue=False)
+    add_row('Age + smoking', ['median_age', 'smoking_avg'], with_evalue=True)
+    add_row('HDI only', ['hdi'], with_evalue=False)
+    add_row('Age + smoking + HDI', ['median_age', 'smoking_avg', 'hdi'], with_evalue=True)
+    add_row('GDP per capita (log) only', ['log_gdp'], with_evalue=False)
+    add_row('Age + smoking + GDP', ['median_age', 'smoking_avg', 'log_gdp'], with_evalue=True)
+
+    return pd.DataFrame(rows), df
+
+
+# ---------------------------------------------------------------------------
+# Genus-level HDI-adjusted scan (reproduces the Note S1 Prevotella /
+# Megasphaera / Collinsella comparison, plus the full 50-genus table)
+# ---------------------------------------------------------------------------
+def build_genus_hdi_scan():
+    genus_country = pd.read_csv(GENUS_COUNTRY_PCT)  # columns: genus, iso3, pct_gt1
+    ci5 = pd.read_csv(CI5_FILE)
+    hdi = load_hdi()
+
+    outcomes = ci5[['iso3', 'ASR_period_avg']].copy()
+    outcomes['hdi'] = outcomes['iso3'].map(hdi)
+    outcomes = outcomes.dropna()
+
+    merged = genus_country.merge(outcomes, on='iso3', how='inner')
+
+    results = []
+    for genus, g in merged.groupby('genus'):
+        if len(g) < 10:
+            continue
+        r_raw, p_raw = stats.pearsonr(g['pct_gt1'], g['ASR_period_avg'])
+        r_adj, p_adj = partial_corr(g['pct_gt1'], g['ASR_period_avg'], g[['hdi']].values)
+        results.append({
+            'genus': genus, 'n': len(g),
+            'r_raw': round(r_raw, 3), 'p_raw': round(p_raw, 4),
+            'r_hdi_adj': round(r_adj, 3), 'p_hdi_adj': round(p_adj, 4),
+        })
+
+    return pd.DataFrame(results).sort_values('p_hdi_adj')
+
+
+if __name__ == '__main__':
+    table_s3, merged_main = build_table_s3()
+    table_s3.to_csv('table_s3_full.csv', index=False)
+    print("Table S3 (full, including the HDI rows missing from the current draft):")
+    print(table_s3.to_string(index=False))
+
+    genus_hdi = build_genus_hdi_scan()
+    genus_hdi.to_csv('genus_hdi_scan.csv', index=False)
+    for g in ['Prevotella', 'Megasphaera', 'Collinsella']:
+        row = genus_hdi[genus_hdi.genus == g]
+        if len(row):
+            r = row.iloc[0]
+            print(f"{g}: raw r={r.r_raw} (p={r.p_raw}) -> HDI-adjusted "
+                  f"r={r.r_hdi_adj} (p={r.p_hdi_adj}), n={r.n}")
+        else:
+            print(f"{g}: not found in genus_country_pct.csv (check it's in "
+                  f"the top-{50} genera list from 04_genus_scan.py)")
