@@ -1,0 +1,118 @@
+"""
+04_genus_scan.py
+
+Computes country-level %>1% relative abundance for the top 50 most abundant
+gut genera (by total reads) in the Abdill compendium, then tests each
+genus's age+smoking-adjusted partial correlation with CI5 period-average
+cancer incidence. This is the specificity check for Figure 3: is Prevotella
+uniquely associated, or is this generic to many gut genera riding the same
+demographic confound?
+
+INPUTS:
+    taxonomic_table.csv.gz, sample_metadata.tsv  (as in script 01)
+    ci5_country_period_avg.csv                    (from script 02)
+    owid-covid-latest.csv                          (Our World in Data static
+        covariates snapshot -- median_age, male/female smoking prevalence;
+        fetch from https://covid.ourworldindata.org/data/latest/owid-covid-latest.csv)
+
+OUTPUT:
+    genus_scan_results.csv  -- genus, n, r_raw, p_raw, r_adj (age+smoking-
+                                adjusted partial correlation), p_adj, p_adj_fdr
+"""
+
+import pandas as pd
+import numpy as np
+from scipy import stats
+import statsmodels.api as sm
+from statsmodels.stats.multitest import multipletests
+import pycountry
+
+TAXONOMIC_TABLE = "taxonomic_table.csv.gz"
+SAMPLE_METADATA = "sample_metadata.tsv"
+TOP_N_GENERA = 50
+
+
+def get_top_genera():
+    header = pd.read_csv(TAXONOMIC_TABLE, nrows=0)
+    genus_cols = [c for c in header.columns if c.count('.') == 5 and not c.endswith('.NA')]
+    totals = pd.Series(0.0, index=genus_cols)
+    for chunk in pd.read_csv(TAXONOMIC_TABLE, chunksize=20000, usecols=['sample'] + genus_cols):
+        totals += chunk[genus_cols].sum(axis=0)
+    return totals.sort_values(ascending=False).head(TOP_N_GENERA).index.tolist()
+
+
+def compute_genus_by_sample(top_genera):
+    results = []
+    for chunk in pd.read_csv(TAXONOMIC_TABLE, chunksize=20000):
+        chunk = chunk.set_index('sample')
+        numeric_cols = chunk.select_dtypes(include=[np.number]).columns
+        total_reads = chunk[numeric_cols].sum(axis=1)
+        sub = chunk[top_genera].copy()
+        sub['total_reads'] = total_reads
+        results.append(sub)
+    return pd.concat(results).reset_index()
+
+
+def compute_country_pct(genus_by_sample, top_genera):
+    meta = pd.read_csv(SAMPLE_METADATA, sep='\t')
+    meta['sample'] = meta['project'] + '_' + meta['srr']
+    df = genus_by_sample.merge(meta[['sample', 'iso']], on='sample', how='inner')
+    df = df[df['total_reads'] >= 10000].copy()
+    df['iso3'] = df['iso'].apply(
+        lambda a2: (pycountry.countries.get(alpha_2=a2).alpha_3 if pycountry.countries.get(alpha_2=a2) else None))
+
+    valid_countries = df.groupby('iso3').size()
+    valid_countries = valid_countries[valid_countries >= 20].index
+
+    records = []
+    for genus in top_genera:
+        pct = df[genus] / df['total_reads'] * 100
+        gt1 = (pct > 1).astype(int)
+        tmp = pd.DataFrame({'iso3': df['iso3'], 'gt1': gt1})
+        country_pct = tmp[tmp['iso3'].isin(valid_countries)].groupby('iso3')['gt1'].mean() * 100
+        for iso3, val in country_pct.items():
+            records.append({'genus': genus.split('.')[-1], 'iso3': iso3, 'pct_gt1': val})
+    return pd.DataFrame(records)
+
+
+def run_scan(genus_country, ci5_path='ci5_country_period_avg.csv', covariates_path='owid-covid-latest.csv'):
+    ci5 = pd.read_csv(ci5_path)
+    covars = pd.read_csv(covariates_path)[['iso_code', 'median_age', 'female_smokers', 'male_smokers']].rename(
+        columns={'iso_code': 'iso3'})
+    covars['smoking_avg'] = covars[['female_smokers', 'male_smokers']].mean(axis=1)
+
+    outcomes = ci5[['iso3', 'ASR_period_avg']].merge(covars[['iso3', 'median_age', 'smoking_avg']], on='iso3').dropna()
+    merged = genus_country.merge(outcomes, on='iso3', how='inner')
+
+    def partial_corr(x, y, z):
+        Xz = sm.add_constant(z)
+        rx = sm.OLS(x, Xz).fit().resid
+        ry = sm.OLS(y, Xz).fit().resid
+        return stats.pearsonr(rx, ry)
+
+    results = []
+    for genus, g in merged.groupby('genus'):
+        if len(g) < 10:
+            continue
+        x, y = g['pct_gt1'].values, g['ASR_period_avg'].values
+        r_raw, p_raw = stats.pearsonr(x, y)
+        r_adj, p_adj = partial_corr(x, y, g[['median_age', 'smoking_avg']].values)
+        results.append({'genus': genus, 'n': len(g), 'r_raw': r_raw, 'p_raw': p_raw,
+                         'r_adj': r_adj, 'p_adj': p_adj})
+
+    res = pd.DataFrame(results).sort_values('p_adj')
+    res['p_adj_fdr'] = multipletests(res['p_adj'], method='fdr_bh')[1]
+    return res
+
+
+if __name__ == '__main__':
+    top_genera = get_top_genera()
+    genus_by_sample = compute_genus_by_sample(top_genera)
+    genus_country = compute_country_pct(genus_by_sample, top_genera)
+    genus_country.to_csv('genus_country_pct.csv', index=False)
+
+    res = run_scan(genus_country)
+    res.to_csv('genus_scan_results.csv', index=False)
+    prevotella_rank = (res['p_adj'] < res.loc[res.genus == 'Prevotella', 'p_adj'].values[0]).sum() + 1
+    print(f"Prevotella rank: {prevotella_rank} of {len(res)}. "
+          f"FDR-adjusted p = {res.loc[res.genus=='Prevotella','p_adj_fdr'].values[0]:.3f}")
