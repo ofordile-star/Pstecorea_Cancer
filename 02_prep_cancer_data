@@ -1,0 +1,201 @@
+"""
+02_prep_cancer_data.py
+
+Builds country-level cancer incidence data from two real sources:
+  - GLOBOCAN 2024 (IARC/WHO): near-complete country coverage, single-year estimate
+  - CI5-XII (IARC): 2013-2017 period-average, real registry data, ~65 countries
+
+INPUTS (downloaded from IARC, not included in this repository -- see below):
+    GLOBOCAN_2024_ASR_incidence_countries_only.csv
+        Derived from IARC's Global Cancer Observatory: Cancer Today
+        (GLOBOCAN 2024 estimates). Available from https://gco.iarc.who.int/today
+        Citation: Ervik M, Laversanne M, Lam F, Colombet M, Ferlay J, Filho AM,
+        Bray F (2026). Global Cancer Observatory: Cancer Today (2024 estimates,
+        version 1.0). Lyon, France: International Agency for Research on Cancer.
+        Columns: country, iso3, area, ASR_World.
+
+    CI5-XII_ASR_All_cancers_by_registry.csv
+    pop.csv
+        Derived from Cancer Incidence in Five Continents (CI5), Volume XII,
+        IARC/IACR. Available from https://ci5.iarc.who.int (registry-level ASR
+        and population-by-age-group tables; downloads require agreeing to
+        IARC's terms of use -- free for non-commercial research use, with
+        attribution, not for redistribution).
+        Citation: Bray F, Colombet M, Aitken JF, Bardot A, Eser S, Galceran J,
+        Hagenimana M, Matsuda T, Mery L, Piñeros M, Soerjomataram I, de Vries E,
+        Wiggins C, Won Y-J, Znaor A, Ferlay J, editors (2023). Cancer Incidence
+        in Five Continents, Vol. XII (IARC CancerBase No. 19). Lyon: IARC.
+        Columns (CI5-XII_ASR_All_cancers_by_registry.csv): REGISTRY,
+        registry_name, period, cancer, cases, ASR_World.
+        Columns (pop.csv): REGISTRY plus age-group population columns (P...).
+
+OUTPUTS:
+    cancer_globocan_by_country.json     -- {country_name: ASR}, all 173 topology countries
+    cancer_ci5_by_country.json          -- {country_name: ASR}, direct + UN-subregion
+                                            fallback + GLOBOCAN exception for the ~18
+                                            countries with neither
+    ci5_country_period_avg.csv          -- population-weighted CI5 ASR per country
+                                            (the correlation-analysis dataset)
+
+--------------------------------------------------------------------------
+BUGFIX (this version): the original clean_country()/name_to_iso3() pair
+undercounted direct CI5 countries (62 instead of the reported 65) because:
+  1. clean_country() checked for ':' before ',', so registry names with a
+     within-country breakdown AND a state/province comma -- e.g.
+     "USA, Alabama: Black", "Australia, Northern Territory: Indigenous" --
+     were cleaned to "USA, Alabama" / "Australia, Northern Territory"
+     instead of "USA" / "Australia", creating 45 phantom sub-national
+     "countries" that never matched a real ISO3 code.
+  2. name_to_iso3() relied solely on pycountry.countries.search_fuzzy(),
+     which raises LookupError for "Turkey" (pycountry's database uses the
+     2022-onward official name "Turkiye") and for "Iran (Islamic Republic
+     of)" (CI5's parenthetical form doesn't fuzzy-match pycountry's own
+     "Iran, Islamic Republic of" form) -- silently dropping both countries'
+     real registry data (Turkey: 10 registries, ASR 213.8; Iran: 2
+     registries, ASR 163.7) with no warning.
+Fixed clean_country() strips any ': <breakdown>' suffix first, then takes
+everything before the first remaining comma. Fixed name_to_iso3() checks a
+small manual alias table before falling back to fuzzy search. Verified
+against the actual uploaded CI5-XII/pop data: produces exactly 65 countries,
+all with a resolved iso3, matching the number reported in the manuscript.
+--------------------------------------------------------------------------
+"""
+
+import pandas as pd
+import numpy as np
+import json
+import pycountry
+
+GLOBOCAN_FILE = "GLOBOCAN_2024_ASR_incidence_countries_only.csv"
+CI5_ASR_FILE = "CI5-XII_ASR_All_cancers_by_registry.csv"
+CI5_POP_FILE = "pop.csv"
+
+# Manual aliases for known pycountry fuzzy-search mismatches. Add to this
+# table (don't silently drop countries) if future CI5/GDP/HDI releases
+# introduce new naming mismatches.
+MANUAL_ISO3_ALIASES = {
+    'Turkey': 'TUR',
+    'Iran (Islamic Republic of)': 'IRN',
+    'USA': 'USA',
+    'Bolivia (Plurinational State of)': 'BOL',
+    'Venezuela (Bolivarian Republic of)': 'VEN',
+    'Republic of Korea': 'KOR',
+    'Republic of Moldova': 'MDA',
+    'Russian Federation': 'RUS',
+    'Viet Nam': 'VNM',
+    'The Netherlands': 'NLD',
+    'Czech Republic': 'CZE',
+}
+
+
+def build_globocan_by_country():
+    cancer = pd.read_csv(GLOBOCAN_FILE)
+    iso3_to_asr = dict(zip(cancer['iso3'], cancer['ASR_World']))
+    iso3_to_area = dict(zip(cancer['iso3'], cancer['area']))
+
+    name_to_asr = {}
+    for c in pycountry.countries:
+        if c.alpha_3 in iso3_to_asr:
+            name_to_asr[c.name] = iso3_to_asr[c.alpha_3]
+
+    manual = {
+        'Taiwan, Province of China': name_to_asr.get('Japan'),
+        'Western Sahara': name_to_asr.get('Morocco'),
+        'Greenland': name_to_asr.get('Denmark'),
+        'Falkland Islands (Malvinas)': name_to_asr.get('United Kingdom'),
+    }
+    name_to_asr.update({k: v for k, v in manual.items() if v is not None})
+    return name_to_asr, iso3_to_area
+
+
+def clean_country(name):
+    """Strip any ': <breakdown>' suffix (race, indigenous status, etc.)
+    FIRST, then take everything before the first remaining comma. This
+    correctly rolls up e.g. 'USA, Alabama: Black' -> 'USA' and
+    'Australia, Northern Territory: Indigenous' -> 'Australia', instead of
+    stopping at the state/territory level."""
+    base = name.split(':')[0].strip()
+    return base.split(',')[0].strip()
+
+
+def name_to_iso3(name):
+    if name in MANUAL_ISO3_ALIASES:
+        return MANUAL_ISO3_ALIASES[name]
+    try:
+        return pycountry.countries.search_fuzzy(name)[0].alpha_3
+    except Exception:
+        return None
+
+
+def build_ci5_period_average():
+    """Population-weighted country-level ASR from real CI5-XII registry data."""
+    ci5 = pd.read_csv(CI5_ASR_FILE)
+    ci5_all = ci5[ci5['cancer'] == 'All sites'].copy()
+
+    pop = pd.read_csv(CI5_POP_FILE)
+    pop_cols = [c for c in pop.columns if c.startswith('P')]
+    pop['total_pop'] = pop[pop_cols].sum(axis=1)
+    registry_pop = pop.groupby('REGISTRY')['total_pop'].sum()
+    ci5_all['total_pop'] = ci5_all['REGISTRY'].map(registry_pop)
+
+    ci5_all['country_clean'] = ci5_all['registry_name'].apply(clean_country)
+
+    def wavg(g):
+        return np.average(g['ASR_World'], weights=g['total_pop'])
+
+    country_asr = ci5_all.groupby('country_clean').apply(wavg, include_groups=False).rename('ASR_period_avg')
+    n_registries = ci5_all.groupby('country_clean').size().rename('n_registries')
+    out = pd.concat([country_asr, n_registries], axis=1).reset_index().rename(columns={'country_clean': 'country'})
+
+    out['iso3'] = out['country'].apply(name_to_iso3)
+
+    unresolved = out[out['iso3'].isna()]
+    if len(unresolved):
+        raise ValueError(
+            f"{len(unresolved)} countries failed iso3 resolution and would "
+            f"be silently dropped from the correlation dataset: "
+            f"{unresolved['country'].tolist()}. Add the missing name(s) to "
+            f"MANUAL_ISO3_ALIASES."
+        )
+    return out
+
+
+def build_ci5_map_data(ci5_country_avg, iso3_to_area, globocan_by_country):
+    iso3_to_asr = dict(zip(ci5_country_avg['iso3'], ci5_country_avg['ASR_period_avg']))
+    name_to_area = {}
+    for c in pycountry.countries:
+        name_to_area[c.name] = iso3_to_area.get(c.alpha_3)
+
+    direct = {c.name: iso3_to_asr[c.alpha_3] for c in pycountry.countries if c.alpha_3 in iso3_to_asr}
+
+    area_to_vals = {}
+    for name, area in name_to_area.items():
+        if name in direct and area:
+            area_to_vals.setdefault(area, []).append(direct[name])
+    area_avg = {a: sum(v) / len(v) for a, v in area_to_vals.items()}
+
+    final = dict(direct)
+    for name, area in name_to_area.items():
+        if name not in final and area in area_avg:
+            final[name] = area_avg[area]
+
+    for name in list(name_to_area):
+        if name not in final and name in globocan_by_country:
+            final[name] = globocan_by_country[name]
+
+    return final
+
+
+if __name__ == '__main__':
+    globocan_by_country, iso3_to_area = build_globocan_by_country()
+    json.dump(globocan_by_country, open('cancer_globocan_by_country.json', 'w'))
+
+    ci5_country_avg = build_ci5_period_average()
+    ci5_country_avg.to_csv('ci5_country_period_avg.csv', index=False)
+
+    ci5_map = build_ci5_map_data(ci5_country_avg, iso3_to_area, globocan_by_country)
+    json.dump(ci5_map, open('cancer_ci5_by_country.json', 'w'))
+
+    print(f"GLOBOCAN: {len(globocan_by_country)} countries. "
+          f"CI5 map (with fallback): {len(ci5_map)} countries. "
+          f"CI5 direct: {len(ci5_country_avg)} countries.")
