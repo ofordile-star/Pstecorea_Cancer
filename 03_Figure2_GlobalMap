@@ -1,0 +1,160 @@
+"""
+03_Figure1_GlobalMap.py
+
+Renders Figure 1: global ecological overlay of P. stercorea abundance and
+cancer incidence, plus the country-level correlation scatter (Panel D).
+
+INPUTS (outputs of 01_prep_prevotella_data.py and 02_prep_cancer_data.py):
+    prevotella_country_pct.json
+    cancer_ci5_by_country.json
+    ci5_country_period_avg.csv
+    country_prevotella_summary.csv
+
+Also requires world country boundary data (Natural Earth via vega-datasets,
+world-110m.json TopoJSON). Download from:
+    https://raw.githubusercontent.com/vega/vega-datasets/main/data/world-110m.json
+(Vega-Datasets project, BSD-3-Clause license; underlying geometry from
+Natural Earth, public domain. Verified structure: top-level keys
+type/transform/objects/arcs, with objects.countries containing 177
+country geometries -- matches what decode_topojson()/geom_to_paths()
+below expect.)
+
+OUTPUT: Figure1_final.png
+"""
+
+import json
+import pandas as pd
+import numpy as np
+import pycountry
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.path import Path
+from matplotlib.patches import PathPatch
+from matplotlib.colors import LinearSegmentedColormap
+from scipy import stats
+
+WORLD_TOPOJSON = "world-110m.json"
+
+
+# ---------------------------------------------------------------------------
+# TopoJSON decoding (minimal, no external geo library required)
+# ---------------------------------------------------------------------------
+def decode_topojson(topo):
+    transform = topo.get('transform')
+    def decode_arc(arc):
+        if transform:
+            scale, translate = transform['scale'], transform['translate']
+            x = y = 0; pts = []
+            for dx, dy in arc:
+                x += dx; y += dy
+                pts.append((x * scale[0] + translate[0], y * scale[1] + translate[1]))
+            return pts
+        return [(p[0], p[1]) for p in arc]
+    return [decode_arc(a) for a in topo['arcs']]
+
+def arc_coords(arcs, idx):
+    return arcs[idx] if idx >= 0 else list(reversed(arcs[~idx]))
+
+def geom_to_paths(geom, decoded_arcs):
+    polys = []
+    if geom['type'] == 'Polygon':
+        rings = [sum((arc_coords(decoded_arcs, ai) for ai in ring), []) for ring in geom['arcs']]
+        polys.append(rings)
+    elif geom['type'] == 'MultiPolygon':
+        for poly_arcs in geom['arcs']:
+            rings = [sum((arc_coords(decoded_arcs, ai) for ai in ring), []) for ring in poly_arcs]
+            polys.append(rings)
+    return polys
+
+def make_path_patch(rings, **kwargs):
+    verts, codes = [], []
+    for ring in rings:
+        if len(ring) < 3: continue
+        verts.append(ring[0]); codes.append(Path.MOVETO)
+        for pt in ring[1:]:
+            verts.append(pt); codes.append(Path.LINETO)
+        verts.append(ring[0]); codes.append(Path.CLOSEPOLY)
+    return PathPatch(Path(verts, codes), **kwargs) if verts else None
+
+def draw_map(ax, country_geoms, id_to_name, decoded_arcs, value_dict, cmap, vmin, vmax,
+             nodata_color='#e8e8e8', edge='#999999', lw=0.25):
+    for g in country_geoms:
+        name = id_to_name.get(g['id'])
+        val = value_dict.get(name) if name else None
+        color = nodata_color if val is None else cmap(max(0, min(1, (val - vmin) / (vmax - vmin))))
+        for rings in geom_to_paths(g, decoded_arcs):
+            patch = make_path_patch(rings, facecolor=color, edgecolor=edge, linewidth=lw)
+            if patch: ax.add_patch(patch)
+    ax.set_xlim(-180, 180); ax.set_ylim(-58, 83); ax.set_aspect(1.35); ax.axis('off')
+
+def bin_to_tier(pct, breaks):
+    """Bin a raw percentage into a 1-5 tier for the categorical legend."""
+    for i, b in enumerate(breaks):
+        if pct < b:
+            return i + 1
+    return len(breaks) + 1
+
+
+if __name__ == '__main__':
+    topo = json.load(open(WORLD_TOPOJSON))
+    decoded_arcs = decode_topojson(topo)
+    country_geoms = topo['objects']['countries']['geometries']
+    id_to_name = {}
+    for g in country_geoms:
+        if g['id'] in (-99, 10): continue
+        c = pycountry.countries.get(numeric=f"{g['id']:03d}")
+        if c: id_to_name[g['id']] = c.name
+
+    prevotella_pct = json.load(open('prevotella_country_pct.json'))
+    cancer_asr = json.load(open('cancer_ci5_by_country.json'))
+
+    # Correlation dataset: merge Prevotella country summary to CI5 period-average
+    # on ISO3 (this IS the dataset behind the r=-0.628, p=4.1e-5, n=36 headline stat)
+    prev_summary = pd.read_csv('country_prevotella_summary.csv')
+    prev_summary = prev_summary[prev_summary['n_samples'] >= 20].copy()
+    prev_summary['iso3'] = prev_summary['iso'].apply(
+        lambda a2: (pycountry.countries.get(alpha_2=a2).alpha_3 if pycountry.countries.get(alpha_2=a2) else None))
+    ci5 = pd.read_csv('ci5_country_period_avg.csv')
+    corr_df = prev_summary.merge(ci5[['iso3', 'ASR_period_avg']], on='iso3', how='inner')
+
+    prevotella_tiers = {k: bin_to_tier(v, [8, 20, 40, 70]) for k, v in prevotella_pct.items() if pd.notna(v)}
+    cancer_tiers = {k: bin_to_tier(v, [50, 100, 200, 300]) for k, v in cancer_asr.items() if pd.notna(v)}
+
+    purple_cmap = LinearSegmentedColormap.from_list('purple', ['#f3ecf8','#c9a8dd','#9b5bc2','#6a1b9a','#3d0a5c'])
+    red_cmap = LinearSegmentedColormap.from_list('red', ['#fff0ec','#fccbb5','#f4906a','#d94f28','#8c1e0a','#4a0d04'])
+
+    fig = plt.figure(figsize=(16, 11), dpi=200)
+    fig.text(0.5, 0.985, r"$\it{Prevotella\ stercorea}$  ↔  Immunity  ↔  Cancer", ha='center',
+              fontsize=22, fontweight='bold', color='#3d0a5c', family='serif')
+    fig.text(0.5, 0.958, "From Microbiome to Immune Modulation to Cancer Risk: A Global Overlay",
+              ha='center', fontsize=12, color='#333333')
+
+    ax1 = fig.add_axes([0.02, 0.545, 0.42, 0.335])
+    draw_map(ax1, country_geoms, id_to_name, decoded_arcs, prevotella_tiers, purple_cmap, 1, 5)
+    fig.text(0.23, 0.905, '1. Prevotella stercorea Abundance', ha='center', fontsize=13, fontweight='bold',
+              color='white', bbox=dict(boxstyle='square,pad=0.6', facecolor='#4a1a6b', edgecolor='none'))
+
+    ax2 = fig.add_axes([0.56, 0.545, 0.42, 0.335])
+    draw_map(ax2, country_geoms, id_to_name, decoded_arcs, cancer_tiers, red_cmap, 1, 5)
+    fig.text(0.77, 0.905, '2. Cancer Incidence (All Cancers)', ha='center', fontsize=13, fontweight='bold',
+              color='white', bbox=dict(boxstyle='square,pad=0.6', facecolor='#8c1a10', edgecolor='none'))
+
+    # Panel D: real correlation scatter
+    ax4 = fig.add_axes([0.70, 0.155, 0.27, 0.30])
+    ax4.scatter(corr_df['pct_prevotella_gt1'], corr_df['ASR_period_avg'], s=22, alpha=0.6,
+                color='#4a1a6b', edgecolor='none')
+    slope, intercept = np.polyfit(corr_df['pct_prevotella_gt1'], corr_df['ASR_period_avg'], 1)
+    xr = np.linspace(corr_df['pct_prevotella_gt1'].min(), corr_df['pct_prevotella_gt1'].max(), 50)
+    ax4.plot(xr, slope * xr + intercept, color='#8c1a10', lw=2)
+    r, p = stats.pearsonr(corr_df['pct_prevotella_gt1'], corr_df['ASR_period_avg'])
+    ax4.text(0.97, 0.95, f"r = {r:.2f}\np = {p:.1e}\nn = {len(corr_df)}", transform=ax4.transAxes,
+              fontsize=8, ha='right', va='top',
+              bbox=dict(boxstyle='round', facecolor='white', edgecolor='#999999', alpha=0.9))
+    ax4.set_xlabel('% samples Prevotella >1%', fontsize=8)
+    ax4.set_ylabel('Cancer ASR (period-avg)', fontsize=8)
+    ax4.set_title('D. Country-level correlation', fontsize=9, fontweight='bold', loc='left')
+    for spine in ['top', 'right']: ax4.spines[spine].set_visible(False)
+
+    plt.savefig('Figure1_final.png', dpi=200, bbox_inches='tight', facecolor='white')
+    print(f"Saved Figure1_final.png. Correlation: r={r:.3f}, p={p:.3g}, n={len(corr_df)}")
