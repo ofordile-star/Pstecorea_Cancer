@@ -1,0 +1,148 @@
+"""
+01_prep_prevotella_data.py
+
+Builds country- and region-level Prevotella prevalence data from the
+Human Microbiome Compendium primary data (Abdill et al. 2025, Cell).
+
+INPUTS (download from https://doi.org/10.5281/zenodo.10452633):
+    sample_metadata.tsv
+    taxonomic_table.csv.gz
+
+OUTPUTS:
+    country_prevotella_summary.csv   -- per-country %Prevotella>1%, n_samples
+    prevotella_country_tiers.json    -- final tier assignment per country
+                                         (direct data where n>=20, UN-subregion
+                                         average of same-region direct-data
+                                         countries otherwise, literature
+                                         overrides for Gambia/Fiji/Burkina Faso/
+                                         El Salvador/Peru per Yeoh et al. 2022,
+                                         De Filippo et al. 2010, IHAT-GUT)
+
+Matches the source paper's own definition exactly: % of samples with
+Prevotella genus relative abundance >1%, restricted to samples with
+>=10,000 total reads.
+"""
+
+import pandas as pd
+import numpy as np
+import json
+import pycountry
+
+SAMPLE_METADATA = "sample_metadata.tsv"
+TAXONOMIC_TABLE = "taxonomic_table.csv.gz"
+PREVOTELLA_COL = "Bacteria.Bacteroidota.Bacteroidia.Bacteroidales.Prevotellaceae.Prevotella"
+
+# ---------------------------------------------------------------------------
+# STEP 1: per-sample Prevotella relative abundance (chunked -- table is large)
+# ---------------------------------------------------------------------------
+def compute_prevotella_by_sample():
+    results = []
+    for chunk in pd.read_csv(TAXONOMIC_TABLE, chunksize=20000):
+        numeric_cols = chunk.select_dtypes(include=[np.number]).columns
+        total_reads = chunk[numeric_cols].sum(axis=1)
+        prevotella = chunk[PREVOTELLA_COL] if PREVOTELLA_COL in chunk.columns else 0
+        results.append(pd.DataFrame({
+            'sample': chunk['sample'],
+            'prevotella_reads': prevotella,
+            'total_reads': total_reads
+        }))
+    return pd.concat(results, ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
+# STEP 2: join to country metadata, apply paper's own QC threshold
+# ---------------------------------------------------------------------------
+def build_country_summary(prev_by_sample):
+    meta = pd.read_csv(SAMPLE_METADATA, sep='\t')
+    meta['sample'] = meta['project'] + '_' + meta['srr']
+    df = meta.merge(prev_by_sample, on='sample', how='inner')
+    df = df[df['total_reads'] >= 10000].copy()
+    df['prevotella_pct'] = df['prevotella_reads'] / df['total_reads'] * 100
+    df['prevotella_gt1pct'] = df['prevotella_pct'] > 1
+
+    country_summary = df.groupby('iso').agg(
+        n_samples=('srs', 'count'),
+        pct_prevotella_gt1=('prevotella_gt1pct', lambda x: 100 * x.mean()),
+    ).sort_values('n_samples', ascending=False).reset_index()
+
+    region_summary = df.groupby('region').agg(
+        n_samples=('srs', 'count'),
+        pct_prevotella_gt1=('prevotella_gt1pct', lambda x: 100 * x.mean()),
+    ).reset_index()
+
+    return country_summary, region_summary
+
+
+# ---------------------------------------------------------------------------
+# STEP 3: build final per-country tier for the map (direct data n>=20,
+# else UN-subregion average using the region membership lists below)
+# ---------------------------------------------------------------------------
+REGION_MEMBERS = {
+    'Northern Africa and Western Asia': ['Egypt','Morocco','Algeria','Tunisia','Libya','Sudan',
+        'Western Sahara','Saudi Arabia','United Arab Emirates','Qatar','Kuwait','Bahrain','Oman',
+        'Yemen','Iraq','Syrian Arab Republic','Jordan','Lebanon','Israel','Palestine, State of',
+        'Türkiye','Cyprus','Armenia','Azerbaijan','Georgia'],
+    'Central and Southern Asia': ['Kazakhstan','Uzbekistan','Turkmenistan','Kyrgyzstan','Tajikistan',
+        'India','Pakistan','Bangladesh','Sri Lanka','Nepal','Bhutan','Afghanistan','Iran, Islamic Republic of'],
+    'Eastern and South-Eastern Asia': ['China','Japan','Korea, Republic of',
+        "Korea, Democratic People's Republic of",'Mongolia','Taiwan, Province of China','Vietnam',
+        'Viet Nam','Thailand','Indonesia','Philippines','Malaysia','Myanmar','Cambodia',
+        "Lao People's Democratic Republic",'Timor-Leste'],
+    'Latin America and the Caribbean': ['Mexico','Guatemala','Belize','Honduras','El Salvador',
+        'Nicaragua','Costa Rica','Panama','Colombia','Venezuela, Bolivarian Republic of','Ecuador',
+        'Peru','Bolivia, Plurinational State of','Brazil','Paraguay','Uruguay','Argentina','Chile',
+        'Cuba','Dominican Republic','Haiti','Jamaica','Trinidad and Tobago','Guyana','Suriname'],
+    'Australia/New Zealand': ['Australia', 'New Zealand'],
+    'Sub-Saharan Africa': ['Nigeria','Kenya','Tanzania, United Republic of','Uganda','Ethiopia',
+        'Rwanda','Burundi','Malawi','Mozambique','Zambia','Madagascar','Somalia','South Sudan',
+        'Congo, The Democratic Republic of the','Congo','Gabon','Angola','Eritrea','Djibouti',
+        'Central African Republic','Mauritania','Zimbabwe','Botswana','Namibia','Lesotho','Eswatini',
+        'South Africa','Senegal','Guinea','Guinea-Bissau','Mali','Niger','Ghana','Togo','Benin',
+        'Sierra Leone','Liberia',"Côte d'Ivoire",'Cameroon','Chad','Gambia'],
+    'Europe and Northern America': ['United States','Canada','United Kingdom','Germany','France',
+        'Italy','Spain','Portugal','Netherlands','Belgium','Switzerland','Austria','Denmark','Norway',
+        'Sweden','Finland','Iceland','Ireland','Poland','Hungary','Slovakia','Czechia','Romania',
+        'Bulgaria','Serbia','Croatia','Bosnia and Herzegovina','Montenegro','North Macedonia','Albania',
+        'Greece','Russian Federation','Ukraine','Belarus','Moldova, Republic of','Estonia','Latvia',
+        'Lithuania','Slovenia','Luxembourg','Malta'],
+}
+
+# Literature overrides where Abdill has no/insufficient direct samples
+LITERATURE_OVERRIDES_PCT = {
+    'Gambia': 65.0,        # IHAT-GUT direct species-level measurement (illustrative tier anchor)
+    'Fiji': 36.1,          # Yeoh et al. 2022, highest of 14 sampled cohorts
+    'Burkina Faso': 55.0,  # De Filippo et al. 2010, directly measured (illustrative tier anchor)
+    'El Salvador': 45.0,   # Yeoh et al. 2022, high-prevalence rural cohort
+    'Peru': 45.0,          # Yeoh et al. 2022, same study as El Salvador
+}
+
+
+def build_map_tiers(country_summary, region_summary):
+    iso_to_name = {c.alpha_2: c.name for c in pycountry.countries}
+    country_pct = {}
+    for _, row in country_summary[country_summary['n_samples'] >= 20].iterrows():
+        name = iso_to_name.get(row['iso'])
+        if name:
+            country_pct[name] = row['pct_prevotella_gt1']
+
+    region_pct = dict(zip(region_summary['region'], region_summary['pct_prevotella_gt1']))
+
+    final_pct = {}
+    for region, members in REGION_MEMBERS.items():
+        fallback = region_pct.get(region, np.nan)
+        for c in members:
+            final_pct[c] = fallback
+    final_pct.update(country_pct)          # direct data overrides region fallback
+    final_pct.update(LITERATURE_OVERRIDES_PCT)  # literature overrides direct/fallback
+
+    return final_pct
+
+
+if __name__ == '__main__':
+    prev_by_sample = compute_prevotella_by_sample()
+    country_summary, region_summary = build_country_summary(prev_by_sample)
+    country_summary.to_csv('country_prevotella_summary.csv', index=False)
+
+    final_pct = build_map_tiers(country_summary, region_summary)
+    json.dump(final_pct, open('prevotella_country_pct.json', 'w'))
+    print(f"Done. {len(final_pct)} countries in final map data.")
