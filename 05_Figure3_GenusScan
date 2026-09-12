@@ -1,0 +1,43 @@
+"""
+05_Figure3_GenusScan.py
+
+Renders Figure 3: rank plot of all 50 abundant gut genera by age+smoking-
+adjusted partial correlation with cancer incidence, Prevotella highlighted.
+
+INPUT: genus_scan_results.csv (from 04_genus_scan.py)
+OUTPUT: Figure3_GenusScan.png
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+if __name__ == '__main__':
+    res = pd.read_csv('genus_scan_results.csv').sort_values('p_adj').reset_index(drop=True)
+
+    fig, ax = plt.subplots(figsize=(9, 11), dpi=200)
+    colors = ['#8c1a10' if g == 'Prevotella' else ('#c98a30' if p < 0.05 else '#999999')
+              for g, p in zip(res['genus'], res['p_adj'])]
+    y = np.arange(len(res))[::-1]
+    ax.barh(y, -res['r_adj'], color=colors, height=0.7)
+    ax.set_yticks(y)
+    labels = [f"{'* ' if g == 'Prevotella' else ''}{g}" for g in res['genus']]
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.axvline(0, color='black', lw=0.8)
+    ax.set_xlabel('Adjusted partial correlation strength\n(higher = stronger inverse association with cancer incidence)', fontsize=9)
+    ax.set_title('Genus-level specificity of the Prevotella-cancer association\n(age+smoking-adjusted, n=35 countries)',
+                 fontsize=12, fontweight='bold')
+    for s in ['top', 'right']: ax.spines[s].set_visible(False)
+
+    prevotella_row = res[res.genus == 'Prevotella'].iloc[0]
+    fig.text(0.5, 0.02,
+              f"Prevotella: rank 1/50, adjusted p={prevotella_row.p_adj:.3f}, "
+              f"BH-FDR-adjusted p={prevotella_row.p_adj_fdr:.3f}. "
+              "Specificity check on an independently-motivated hypothesis (Figure 2), not an exploratory discovery analysis.",
+              ha='center', fontsize=8, style='italic', wrap=True)
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    plt.savefig('Figure3_GenusScan.png', dpi=200, bbox_inches='tight')
+    print("Saved Figure3_GenusScan.png")
