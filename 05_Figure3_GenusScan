@@ -1,11 +1,16 @@
 """
-05_Figure3_GenusScan.py
+05_Figure3_Full.py
 
-Renders Figure 3: rank plot of all 50 abundant gut genera by age+smoking-
-adjusted partial correlation with cancer incidence, Prevotella highlighted.
+Renders the complete, publication-format Figure 3:
+    Title + subtitle
+    Panel A: all 50 abundant gut genera ranked by age+smoking-adjusted
+             partial correlation with cancer incidence (Prevotella highlighted,
+             "Prevotella: rank 1/50" callout)
+    Panel B: raw vs. age+smoking-adjusted correlation strength for the top 5
+             ranked genera (grouped bar chart)
 
 INPUT: genus_scan_results.csv (from 04_genus_scan.py)
-OUTPUT: Figure3_GenusScan.png
+OUTPUT: Figure3_full.pdf (vector, for submission), Figure3_full.png (raster preview)
 """
 
 import pandas as pd
@@ -16,28 +21,62 @@ import matplotlib.pyplot as plt
 
 if __name__ == '__main__':
     res = pd.read_csv('genus_scan_results.csv').sort_values('p_adj').reset_index(drop=True)
+    n_countries = int(res['n'].iloc[0])
 
-    fig, ax = plt.subplots(figsize=(9, 11), dpi=200)
+    fig = plt.figure(figsize=(15, 10), dpi=200)
+    fig.text(0.5, 0.98, "Genus-level specificity of the Prevotella-cancer ecological association",
+              ha='center', fontsize=17, fontweight='bold')
+    fig.text(0.5, 0.955,
+              f"Age- and smoking-adjusted partial correlation with cancer incidence, all 50 abundant gut genera (n={n_countries} countries)",
+              ha='center', fontsize=11.5, color='#333333')
+
+    # ------------------------------------------------------------------
+    # Panel A: full ranked bar chart
+    # ------------------------------------------------------------------
+    ax1 = fig.add_axes([0.06, 0.06, 0.60, 0.83])
     colors = ['#8c1a10' if g == 'Prevotella' else ('#c98a30' if p < 0.05 else '#999999')
               for g, p in zip(res['genus'], res['p_adj'])]
     y = np.arange(len(res))[::-1]
-    ax.barh(y, -res['r_adj'], color=colors, height=0.7)
-    ax.set_yticks(y)
+    ax1.barh(y, -res['r_adj'], color=colors, height=0.7)
+    ax1.set_yticks(y)
     labels = [f"{'* ' if g == 'Prevotella' else ''}{g}" for g in res['genus']]
-    ax.set_yticklabels(labels, fontsize=7)
-    ax.axvline(0, color='black', lw=0.8)
-    ax.set_xlabel('Adjusted partial correlation strength\n(higher = stronger inverse association with cancer incidence)', fontsize=9)
-    ax.set_title('Genus-level specificity of the Prevotella-cancer association\n(age+smoking-adjusted, n=35 countries)',
-                 fontsize=12, fontweight='bold')
-    for s in ['top', 'right']: ax.spines[s].set_visible(False)
+    ax1.set_yticklabels(labels, fontsize=7.5)
+    ax1.axvline(0, color='black', lw=0.8)
+    ax1.set_xlabel('Adjusted partial correlation strength\n(inverse direction: higher = stronger negative assoc. with cancer)', fontsize=9.5)
+    ax1.set_title('A. All 50 genera, ranked by significance', fontsize=13, fontweight='bold', loc='left')
+    for s in ['top', 'right']: ax1.spines[s].set_visible(False)
+    ax1.set_ylim(-1, len(res) + 3.5)
 
+    # "Prevotella: rank 1/50" callout, placed above the plotted bars with a
+    # line pointing down at the Prevotella bar
     prevotella_row = res[res.genus == 'Prevotella'].iloc[0]
-    fig.text(0.5, 0.02,
-              f"Prevotella: rank 1/50, adjusted p={prevotella_row.p_adj:.3f}, "
-              f"BH-FDR-adjusted p={prevotella_row.p_adj_fdr:.3f}. "
-              "Specificity check on an independently-motivated hypothesis (Figure 2), not an exploratory discovery analysis.",
-              ha='center', fontsize=8, style='italic', wrap=True)
+    prevotella_y = y[res.index[res.genus == 'Prevotella'][0]]
+    xmax = float((-res['r_adj']).max())
+    ax1.annotate(f"Prevotella: rank 1/{len(res)}",
+                 xy=(xmax * 0.9, prevotella_y + 0.5), xytext=(xmax * 0.55, len(res) + 2.2),
+                 fontsize=12, fontweight='bold', color='#8c1a10', ha='center',
+                 arrowprops=dict(arrowstyle='-', color='#8c1a10', lw=1.2,
+                                  connectionstyle='arc3,rad=-0.15'))
 
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
-    plt.savefig('Figure3_GenusScan.png', dpi=200, bbox_inches='tight')
-    print("Saved Figure3_GenusScan.png")
+    # ------------------------------------------------------------------
+    # Panel B: top-5 raw vs adjusted grouped bars
+    # ------------------------------------------------------------------
+    ax2 = fig.add_axes([0.72, 0.20, 0.25, 0.68])
+    top5 = res.head(5).copy()
+    short_labels = [g if len(g) <= 11 else g[:10] for g in top5['genus']]
+    xpos = np.arange(len(top5))
+    width = 0.38
+    ax2.bar(xpos - width / 2, top5['r_raw'], width, color='#c9a8dd', label='Raw', edgecolor='none')
+    ax2.bar(xpos + width / 2, top5['r_adj'], width, color='#3d0a5c', label='Age+smoking adj.', edgecolor='none')
+    ax2.axhline(0, color='black', lw=0.8)
+    ax2.set_xticks(xpos)
+    ax2.set_xticklabels(short_labels, rotation=35, ha='right', fontsize=9)
+    ax2.set_ylabel('Correlation strength', fontsize=9.5)
+    ax2.set_title('B. Top 5 genera: raw vs. adjusted', fontsize=12, fontweight='bold', loc='left')
+    ax2.legend(fontsize=8, loc='upper right', frameon=True)
+    for s in ['top', 'right']: ax2.spines[s].set_visible(False)
+
+    plt.savefig('Figure3_full.pdf', bbox_inches='tight', facecolor='white')
+    plt.savefig('Figure3_full.png', dpi=200, bbox_inches='tight', facecolor='white')
+    print(f"Saved Figure3_full.pdf/.png. Prevotella: rank 1/{len(res)}, "
+          f"adjusted p={prevotella_row.p_adj:.4f}, FDR-adjusted p={prevotella_row.p_adj_fdr:.3f}")
