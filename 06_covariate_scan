@@ -54,8 +54,8 @@ from scipy import stats
 
 HDI_URL = "https://ourworldindata.org/grapher/human-development-index.csv?v=1&csvType=full&useColumnShortNames=false"
 GDP_URL = "https://ourworldindata.org/grapher/gdp-per-capita-worldbank.csv?v=1&csvType=full&useColumnShortNames=false"
-HDI_FILE = None  # set to a local path to use an offline copy instead of HDI_URL
-GDP_FILE = None  # set to a local path to use an offline copy instead of GDP_URL
+HDI_FILE = 'human-development-index.csv'  # local upload
+GDP_FILE = 'gdp-per-capita-worldbank.csv'  # local upload
 HDI_YEAR = 2023   # matches manuscript Methods: "most recent available year, 2023"
 
 PREVOTELLA_SUMMARY = "country_prevotella_summary.csv"
