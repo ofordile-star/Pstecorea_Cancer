@@ -1,0 +1,82 @@
+# =============================================================================
+# Figure 4 — Dose-Response CRP (Low WAZ)
+# =============================================================================
+
+library(tidyverse)
+library(broom)
+
+rds_dir    <- "C:/Users/oofordile/Desktop/IHAT_Paper2_RDS/"
+output_dir <- "C:/Users/oofordile/Desktop/Cancer_Paper_Results/"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+mb_raw <- readRDS(file.path(rds_dir, "mb_full.rds"))
+
+# Normalize column names
+mb <- mb_raw %>%
+  rename(
+    age_sampling  = any_of(c("age at sampling", "age_sampling")),
+    age_enrolment = any_of(c("age at enrolment", "age_enrolment"))
+  )
+
+# Robust feature engineering for Panel A variables
+if ("Prevotella_stercorea_7.05" %in% names(mb)) {
+  mb <- mb %>% mutate(log_Pstercorea = log1p(Prevotella_stercorea_7.05))
+} else if (!"log_Pstercorea" %in% names(mb)) {
+  stop("Neither Prevotella_stercorea_7.05 nor log_Pstercorea found in dataset.")
+}
+
+if ("CRP" %in% names(mb)) {
+  mb <- mb %>% mutate(log_CRP = log1p(CRP))
+} else if (!"log_CRP" %in% names(mb)) {
+  stop("Neither CRP nor log_CRP found in dataset.")
+}
+
+if ("gender" %in% names(mb)) {
+  mb <- mb %>% mutate(gender_n = as.integer(gender == "Male"))
+} else if (!"gender_n" %in% names(mb)) {
+  stop("Neither gender nor gender_n found in dataset.")
+}
+
+# ---------------------------------------------------------------------------
+# DATA PREPARATION (D1 Low WAZ Stratum)
+# ---------------------------------------------------------------------------
+d1 <- mb %>%
+  filter(timepoints == "D1") %>%
+  dplyr::select(rand_no, WAZ_enrolment, log_CRP, log_Pstercorea,
+                HAZ_enrolment, age_sampling, gender_n) %>%
+  drop_na()
+
+waz_med_d1 <- median(d1$WAZ_enrolment, na.rm = TRUE)
+d1 <- d1 %>%
+  mutate(WAZ_group = factor(
+    if_else(WAZ_enrolment <= waz_med_d1, "Low WAZ", "High WAZ"),
+    levels = c("Low WAZ", "High WAZ")))
+
+d_low <- d1 %>% filter(WAZ_group == "Low WAZ")
+
+# ---------------------------------------------------------------------------
+# Dose-response, P. stercorea -> CRP, Low WAZ
+# ---------------------------------------------------------------------------
+fit_A <- lm(log_CRP ~ log_Pstercorea + HAZ_enrolment + age_sampling + gender_n, data = d_low)
+tidy_A <- tidy(fit_A, conf.int = TRUE) %>% filter(term == "log_Pstercorea")
+
+panel_A <- ggplot(d_low, aes(log_Pstercorea, log_CRP)) +
+  geom_point(alpha = 0.45, size = 1.5, color = "#4a1a6b") +
+  geom_smooth(method = "lm", formula = y ~ x, color = "#8c1a10", fill = "#f4b8ad", se = TRUE) +
+  labs(
+    x = "log(1+x) P. stercorea, D1", 
+    y = "log(1+x) CRP, D1",
+    title = "P. stercorea vs. CRP (Low WAZ)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+# ---------------------------------------------------------------------------
+# SAVE OUTPUTS
+# ---------------------------------------------------------------------------
+ggsave(file.path(output_dir, "Figure2_PanelA.pdf"), panel_A, width = 5, height = 4, dpi = 300)
+ggsave(file.path(output_dir, "Figure2_PanelA.png"), panel_A, width = 5, height = 4, dpi = 300)
+
+write_csv(tidy_A %>% mutate(panel = "A"), file.path(output_dir, "Figure2_PanelA_stats.csv"))
+
+cat("Done. Panel A plot and stats table written to", output_dir, "\n")
