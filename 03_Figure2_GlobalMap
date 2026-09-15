@@ -1,25 +1,39 @@
 """
-03_Figure1_GlobalMap.py
+03_Figure2_Full.py
 
-Renders Figure 1: global ecological overlay of P. stercorea abundance and
-cancer incidence, plus the country-level correlation scatter (Panel D).
+Renders the complete, publication-format Figure 2:
+    Title + subtitle
+    Panel A: Prevotella stercorea abundance world map (categorical legend)
+    Panel B: Cancer incidence world map (categorical legend)
+    Center: causal-chain text diagram (P. stercorea -> Immune System -> Cancer Risk)
+    Panel C: bivariate overlay map (High P/Low Cancer, Low P/High Cancer, Mixed, No Data)
+    Panel D: country-level correlation scatter with raw + adjusted stats box
+    Footer: methods/caveats disclaimer box
 
 INPUTS (outputs of 01_prep_prevotella_data.py and 02_prep_cancer_data.py):
     prevotella_country_pct.json
     cancer_ci5_by_country.json
     ci5_country_period_avg.csv
     country_prevotella_summary.csv
+    world-110m.json  (Natural Earth via vega-datasets, BSD-3-Clause;
+        https://raw.githubusercontent.com/vega/vega-datasets/main/data/world-110m.json)
 
-Also requires world country boundary data (Natural Earth via vega-datasets,
-world-110m.json TopoJSON). Download from:
-    https://raw.githubusercontent.com/vega/vega-datasets/main/data/world-110m.json
-(Vega-Datasets project, BSD-3-Clause license; underlying geometry from
-Natural Earth, public domain. Verified structure: top-level keys
-type/transform/objects/arcs, with objects.countries containing 177
-country geometries -- matches what decode_topojson()/geom_to_paths()
-below expect.)
+Also uses the age+smoking-adjusted correlation (Table S3) and the GLOBOCAN
+robustness check (Table S2) for Panel D's stats box and the footer note.
+These are hardcoded from table_s3_full.csv / the GLOBOCAN comparison computed
+in 03_Figure2_GlobalMap.py's companion run -- update the CURRENT_STATS block
+below if the underlying data pipeline is rerun.
 
-OUTPUT: Figure1_final.png
+OUTPUT: Figure2_full.pdf (vector, for submission), Figure2_full.png (raster preview)
+
+NOTE ON PANEL C: the bivariate overlay classification (High P. stercorea +
+Low Cancer / Low P. stercorea + High Cancer / Mixed-Transition / No Data)
+was not present in any of the originally deposited scripts (01-06) -- only
+the finished image was available for reference. The thresholds below
+(Prevotella >=40% = "High", <20% = "Low"; Cancer ASR >=200 = "High", <100 =
+"Low"; the same breakpoints already used for the Panel A/B tier maps) are a
+reconstruction chosen to reproduce the reference figure's visual pattern.
+Confirm these match the original classification logic before final use.
 """
 
 import json
@@ -30,11 +44,19 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
-from matplotlib.patches import PathPatch
+from matplotlib.patches import PathPatch, FancyArrow
 from matplotlib.colors import LinearSegmentedColormap
 from scipy import stats
 
 WORLD_TOPOJSON = "world-110m.json"
+
+# Filled in from the current pipeline run (see 06_covariate_scan.py / Table S3,
+# and the GLOBOCAN robustness check). Update if data is regenerated.
+CURRENT_STATS = {
+    'raw_r': -0.626, 'raw_p': 4.5e-05, 'raw_n': 36,
+    'adj_r': -0.345, 'adj_p': 0.039, 'adj_n': 36,
+    'globocan_r': -0.628, 'globocan_p': 1.3e-07, 'globocan_n': 58,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -77,23 +99,33 @@ def make_path_patch(rings, **kwargs):
         verts.append(ring[0]); codes.append(Path.CLOSEPOLY)
     return PathPatch(Path(verts, codes), **kwargs) if verts else None
 
-def draw_map(ax, country_geoms, id_to_name, decoded_arcs, value_dict, cmap, vmin, vmax,
-             nodata_color='#e8e8e8', edge='#999999', lw=0.25):
+def draw_map(ax, country_geoms, id_to_name, decoded_arcs, color_dict,
+             nodata_color='#e8e8e8', edge='#999999', lw=0.3):
     for g in country_geoms:
         name = id_to_name.get(g['id'])
-        val = value_dict.get(name) if name else None
-        color = nodata_color if val is None else cmap(max(0, min(1, (val - vmin) / (vmax - vmin))))
+        color = color_dict.get(name, nodata_color) if name else nodata_color
         for rings in geom_to_paths(g, decoded_arcs):
             patch = make_path_patch(rings, facecolor=color, edgecolor=edge, linewidth=lw)
             if patch: ax.add_patch(patch)
     ax.set_xlim(-180, 180); ax.set_ylim(-58, 83); ax.set_aspect(1.35); ax.axis('off')
 
 def bin_to_tier(pct, breaks):
-    """Bin a raw percentage into a 1-5 tier for the categorical legend."""
+    if pct is None or (isinstance(pct, float) and np.isnan(pct)):
+        return None
     for i, b in enumerate(breaks):
         if pct < b:
             return i + 1
     return len(breaks) + 1
+
+def draw_legend(ax, x, y, entries, box_w=0.028, box_h=0.030, gap=0.008, fontsize=10):
+    """entries: list of (color, label). Drawn top-to-bottom at axes-fraction (x,y)."""
+    for i, (color, label) in enumerate(entries):
+        yy = y - i * (box_h + gap)
+        ax.add_patch(plt.Rectangle((x, yy - box_h), box_w, box_h, transform=ax.transAxes,
+                                    facecolor=color, edgecolor='#555555', linewidth=0.5,
+                                    clip_on=False))
+        ax.text(x + box_w + 0.012, yy - box_h / 2, label, transform=ax.transAxes,
+                fontsize=fontsize, va='center', ha='left')
 
 
 if __name__ == '__main__':
@@ -109,52 +141,176 @@ if __name__ == '__main__':
     prevotella_pct = json.load(open('prevotella_country_pct.json'))
     cancer_asr = json.load(open('cancer_ci5_by_country.json'))
 
-    # Correlation dataset: merge Prevotella country summary to CI5 period-average
-    # on ISO3 (this IS the dataset behind the r=-0.628, p=4.1e-5, n=36 headline stat)
+    # Correlation dataset (Panel D)
     prev_summary = pd.read_csv('country_prevotella_summary.csv')
     prev_summary = prev_summary[prev_summary['n_samples'] >= 20].copy()
     prev_summary['iso3'] = prev_summary['iso'].apply(
         lambda a2: (pycountry.countries.get(alpha_2=a2).alpha_3 if pycountry.countries.get(alpha_2=a2) else None))
     ci5 = pd.read_csv('ci5_country_period_avg.csv')
     corr_df = prev_summary.merge(ci5[['iso3', 'ASR_period_avg']], on='iso3', how='inner')
+    r, p = stats.pearsonr(corr_df['pct_prevotella_gt1'], corr_df['ASR_period_avg'])
 
-    prevotella_tiers = {k: bin_to_tier(v, [8, 20, 40, 70]) for k, v in prevotella_pct.items() if pd.notna(v)}
-    cancer_tiers = {k: bin_to_tier(v, [50, 100, 200, 300]) for k, v in cancer_asr.items() if pd.notna(v)}
+    # Colour scales
+    purple_cmap = LinearSegmentedColormap.from_list('purple', ['#f3ecf8', '#c9a8dd', '#9b5bc2', '#6a1b9a', '#3d0a5c'])
+    red_cmap = LinearSegmentedColormap.from_list('red', ['#fff0ec', '#fccbb5', '#f4906a', '#d94f28', '#8c1e0a'])
+    PREV_BREAKS = [8, 20, 40, 70]
+    CANC_BREAKS = [50, 100, 200, 300]
+    prev_tier_colors = {i + 1: purple_cmap(i / 4) for i in range(5)}
+    canc_tier_colors = {i + 1: red_cmap(i / 4) for i in range(5)}
 
-    purple_cmap = LinearSegmentedColormap.from_list('purple', ['#f3ecf8','#c9a8dd','#9b5bc2','#6a1b9a','#3d0a5c'])
-    red_cmap = LinearSegmentedColormap.from_list('red', ['#fff0ec','#fccbb5','#f4906a','#d94f28','#8c1e0a','#4a0d04'])
+    prev_color_map = {}
+    prev_tier_map = {}
+    for name, pct in prevotella_pct.items():
+        t = bin_to_tier(pct, PREV_BREAKS)
+        prev_tier_map[name] = t
+        prev_color_map[name] = prev_tier_colors.get(t, '#e8e8e8')
 
-    fig = plt.figure(figsize=(16, 11), dpi=200)
-    fig.text(0.5, 0.985, r"$\it{Prevotella\ stercorea}$  ↔  Immunity  ↔  Cancer", ha='center',
-              fontsize=22, fontweight='bold', color='#3d0a5c', family='serif')
-    fig.text(0.5, 0.958, "From Microbiome to Immune Modulation to Cancer Risk: A Global Overlay",
-              ha='center', fontsize=12, color='#333333')
+    canc_color_map = {}
+    canc_tier_map = {}
+    for name, asr in cancer_asr.items():
+        t = bin_to_tier(asr, CANC_BREAKS)
+        canc_tier_map[name] = t
+        canc_color_map[name] = canc_tier_colors.get(t, '#e8e8e8')
 
-    ax1 = fig.add_axes([0.02, 0.545, 0.42, 0.335])
-    draw_map(ax1, country_geoms, id_to_name, decoded_arcs, prevotella_tiers, purple_cmap, 1, 5)
-    fig.text(0.23, 0.905, '1. Prevotella stercorea Abundance', ha='center', fontsize=13, fontweight='bold',
-              color='white', bbox=dict(boxstyle='square,pad=0.6', facecolor='#4a1a6b', edgecolor='none'))
+    # Panel C: bivariate overlay classification (see NOTE in module docstring)
+    COL_HIGH_LOW = '#4040c8'   # High Prevotella + Low Cancer
+    COL_LOW_HIGH = '#e0356b'   # Low Prevotella + High Cancer
+    COL_MIXED = '#9c5f8a'      # Mixed / transition
+    COL_NODATA = '#bdbdbd'
+    overlay_color_map = {}
+    all_names = set(prev_tier_map) | set(canc_tier_map)
+    for name in all_names:
+        pt, ct = prev_tier_map.get(name), canc_tier_map.get(name)
+        if pt is None or ct is None:
+            overlay_color_map[name] = COL_NODATA
+        elif pt >= 4 and ct <= 2:
+            overlay_color_map[name] = COL_HIGH_LOW
+        elif pt <= 2 and ct >= 4:
+            overlay_color_map[name] = COL_LOW_HIGH
+        else:
+            overlay_color_map[name] = COL_MIXED
 
-    ax2 = fig.add_axes([0.56, 0.545, 0.42, 0.335])
-    draw_map(ax2, country_geoms, id_to_name, decoded_arcs, cancer_tiers, red_cmap, 1, 5)
-    fig.text(0.77, 0.905, '2. Cancer Incidence (All Cancers)', ha='center', fontsize=13, fontweight='bold',
-              color='white', bbox=dict(boxstyle='square,pad=0.6', facecolor='#8c1a10', edgecolor='none'))
+    # ------------------------------------------------------------------
+    # Figure layout
+    # ------------------------------------------------------------------
+    fig = plt.figure(figsize=(18, 13), dpi=200)
 
-    # Panel D: real correlation scatter
-    ax4 = fig.add_axes([0.70, 0.155, 0.27, 0.30])
-    ax4.scatter(corr_df['pct_prevotella_gt1'], corr_df['ASR_period_avg'], s=22, alpha=0.6,
+    fig.text(0.5, 0.985, r"$\it{Prevotella\ stercorea}$  $\leftrightarrow$  $\bf{Immunity}$  $\leftrightarrow$  $\bf{Cancer}$",
+              ha='center', fontsize=24, color='#3d0a5c', family='serif')
+    fig.text(0.5, 0.965, "From Microbiome to Immune Modulation to Cancer Risk: A Global Overlay",
+              ha='center', fontsize=13, color='#333333')
+
+    # Panel A
+    ax1 = fig.add_axes([0.02, 0.62, 0.40, 0.30])
+    draw_map(ax1, country_geoms, id_to_name, decoded_arcs, prev_color_map)
+    fig.text(0.22, 0.925, 'A. Prevotella stercorea Abundance', ha='center', fontsize=14, fontweight='bold',
+              color='white', bbox=dict(boxstyle='square,pad=0.5', facecolor='#4a1a6b', edgecolor='none'))
+    fig.text(0.22, 0.905, '(Illustrative extrapolation from genus-level relative abundance)',
+              ha='center', fontsize=9, style='italic', color='#444444')
+    draw_legend(ax1, 0.02, 0.62, [
+        (prev_tier_colors[5], 'Very High'), (prev_tier_colors[4], 'High'),
+        (prev_tier_colors[3], 'Moderate'), (prev_tier_colors[2], 'Low'),
+        (prev_tier_colors[1], 'Very Low'), ('#e8e8e8', 'No Data'),
+    ])
+    _prev_raw = pd.read_csv('country_prevotella_summary.csv')
+    n_any_data = len(_prev_raw)  # total distinct countries/regions with any direct sample data
+    n_direct = int((_prev_raw['n_samples'] >= 20).sum())  # meeting the n>=20 direct-value threshold
+    total_samples = int(_prev_raw['n_samples'].sum())
+    ax1.text(0.0, -0.04,
+             f"Sources: computed directly from Abdill et al. 2025 primary data\n"
+             f"({total_samples/1000:.0f}K samples/{n_any_data} countries). Direct country-level value where n>=20\n"
+             f"({n_direct} countries); UN-subregion average for same-region countries with\n"
+             f"direct data elsewhere. Yeoh 2022; De Filippo 2010; IHAT-GUT.",
+             transform=ax1.transAxes, fontsize=7, style='italic', color='#666666', va='top')
+
+    # Panel B
+    ax2 = fig.add_axes([0.58, 0.62, 0.40, 0.30])
+    draw_map(ax2, country_geoms, id_to_name, decoded_arcs, canc_color_map)
+    fig.text(0.78, 0.925, 'B. Cancer Incidence (All Cancers)', ha='center', fontsize=14, fontweight='bold',
+              color='white', bbox=dict(boxstyle='square,pad=0.5', facecolor='#8c1a10', edgecolor='none'))
+    fig.text(0.78, 0.907, 'Age-Standardized Rate per 100,000 (Both Sexes)',
+              ha='center', fontsize=9, style='italic', color='#444444')
+    draw_legend(ax2, 0.02, 0.58, [
+        (canc_tier_colors[5], 'Very High (\u2265300)'), (canc_tier_colors[4], 'High (200-300)'),
+        (canc_tier_colors[3], 'Moderate (100-200)'), (canc_tier_colors[2], 'Low (50-100)'),
+        (canc_tier_colors[1], 'Very Low (<50)'), ('#e8e8e8', 'No Data'),
+    ])
+    n_ci5_direct = int(pd.read_csv('ci5_country_period_avg.csv')['iso3'].notna().sum())
+    n_ci5_map_total = len(cancer_asr)
+    ax2.text(0.0, -0.04,
+             f"Source: IARC CI5-XII (2013-2017), period-average ASR (World std.),\n"
+             f"pop.-weighted per country. {n_ci5_direct}/{n_ci5_map_total} direct registry data;\n"
+             f"remainder via same UN-subregion average or GLOBOCAN 2024 (no subregion peer).",
+             transform=ax2.transAxes, fontsize=7, style='italic', color='#666666', va='top')
+
+    # Center causal-chain text (drawn on a dedicated full-figure overlay axes
+    # so we can use axes-level annotate() for the arrows)
+    arrow_ax = fig.add_axes([0, 0, 1, 1])
+    arrow_ax.axis('off')
+    arrow_ax.set_xlim(0, 1); arrow_ax.set_ylim(0, 1)
+    fig.text(0.50, 0.905, r"$\it{Prevotella\ stercorea}$", ha='center', fontsize=12, color='#4a1a6b', style='italic')
+    fig.text(0.50, 0.886, "Modulates Immune System", ha='center', fontsize=10.5, color='#4a1a6b', fontweight='bold')
+    arrow_ax.annotate('', xy=(0.50, 0.850), xytext=(0.50, 0.874),
+                       arrowprops=dict(arrowstyle='-|>', color='#4a1a6b', lw=1.5))
+    fig.text(0.50, 0.832, "Immune System (Innate + Adaptive)", ha='center', fontsize=10.5, color='#1a3a6b', fontweight='bold')
+    fig.text(0.50, 0.814, "Modulates Cancer Risk", ha='center', fontsize=10.5, color='#1a3a6b', fontweight='bold')
+    arrow_ax.annotate('', xy=(0.50, 0.778), xytext=(0.50, 0.802),
+                       arrowprops=dict(arrowstyle='-|>', color='#8c1a10', lw=1.5))
+    fig.text(0.50, 0.758, "Altered Cancer Susceptibility", ha='center', fontsize=11.5, color='#8c1a10', fontweight='bold')
+
+    # Panel C: overlay
+    ax3 = fig.add_axes([0.02, 0.09, 0.55, 0.44])
+    draw_map(ax3, country_geoms, id_to_name, decoded_arcs, overlay_color_map)
+    fig.text(0.30, 0.535, 'C. Overlay: Prevotella stercorea Abundance vs Cancer Incidence',
+              ha='center', fontsize=14, fontweight='bold', color='#222222')
+    fig.text(0.30, 0.515, '(Purple = Higher Prevotella stercorea, Red = Higher Cancer Incidence)',
+              ha='center', fontsize=9.5, style='italic', color='#444444')
+    draw_legend(ax3, 0.02, 0.41, [
+        (COL_HIGH_LOW, 'High P. stercorea + Low Cancer\n(e.g., rural Africa, South Asia)'),
+        (COL_LOW_HIGH, 'Low P. stercorea + High Cancer\n(e.g., N. America, Europe, Australia)'),
+        (COL_MIXED, 'Mixed / Transition Zones\n(e.g., Latin America, China, Middle East)'),
+        (COL_NODATA, 'No Data'),
+    ], box_h=0.045, gap=0.028, fontsize=10.5)
+
+    # Panel D: correlation scatter
+    ax4 = fig.add_axes([0.635, 0.185, 0.33, 0.33])
+    ax4.scatter(corr_df['pct_prevotella_gt1'], corr_df['ASR_period_avg'], s=32, alpha=0.65,
                 color='#4a1a6b', edgecolor='none')
     slope, intercept = np.polyfit(corr_df['pct_prevotella_gt1'], corr_df['ASR_period_avg'], 1)
     xr = np.linspace(corr_df['pct_prevotella_gt1'].min(), corr_df['pct_prevotella_gt1'].max(), 50)
     ax4.plot(xr, slope * xr + intercept, color='#8c1a10', lw=2)
-    r, p = stats.pearsonr(corr_df['pct_prevotella_gt1'], corr_df['ASR_period_avg'])
-    ax4.text(0.97, 0.95, f"r = {r:.2f}\np = {p:.1e}\nn = {len(corr_df)}", transform=ax4.transAxes,
-              fontsize=8, ha='right', va='top',
-              bbox=dict(boxstyle='round', facecolor='white', edgecolor='#999999', alpha=0.9))
-    ax4.set_xlabel('% samples Prevotella >1%', fontsize=8)
-    ax4.set_ylabel('Cancer ASR (period-avg)', fontsize=8)
-    ax4.set_title('D. Country-level correlation', fontsize=9, fontweight='bold', loc='left')
+    stats_box = (f"Raw: r={CURRENT_STATS['raw_r']:.2f}, p={CURRENT_STATS['raw_p']:.1e}, n={CURRENT_STATS['raw_n']}\n"
+                 f"Age+smoking-adj.:\nr={CURRENT_STATS['adj_r']:.2f}, p={CURRENT_STATS['adj_p']:.3f}, n={CURRENT_STATS['adj_n']}")
+    ax4.text(0.97, 0.95, stats_box, transform=ax4.transAxes, fontsize=9.5, ha='right', va='top',
+              bbox=dict(boxstyle='round', facecolor='white', edgecolor='#999999', alpha=0.95))
+    ax4.set_xlabel('% samples Prevotella >1%', fontsize=10)
+    ax4.set_ylabel('Cancer ASR (period-avg)', fontsize=10)
+    ax4.set_title('D. Country-level correlation', fontsize=13, fontweight='bold', loc='left')
     for spine in ['top', 'right']: ax4.spines[spine].set_visible(False)
+    fig.text(0.80, 0.100, "Key Takeaway: higher P. stercorea abundance associates with lower cancer incidence.\n"
+                           "Ecological comparison; does not establish causation.",
+              ha='center', fontsize=8.5, style='italic', color='#333333')
 
-    plt.savefig('Figure1_final.png', dpi=200, bbox_inches='tight', facecolor='white')
-    print(f"Saved Figure1_final.png. Correlation: r={r:.3f}, p={p:.3g}, n={len(corr_df)}")
+    # Footer disclaimer box
+    footer_ax = fig.add_axes([0.02, 0.005, 0.615, 0.075])
+    footer_ax.axis('off')
+    footer_ax.add_patch(plt.Rectangle((0, 0), 1, 1, transform=footer_ax.transAxes,
+                                       facecolor='#fdf6d8', edgecolor='#c9b84a', linewidth=1))
+    footer_ax.text(0.015, 0.85,
+        "This visualization is a high-level ecological comparison for hypothesis generation only.",
+        transform=footer_ax.transAxes, fontsize=9, fontweight='bold', va='top')
+    footer_ax.text(0.015, 0.60,
+        "It does not imply causation. Many confounders exist (diet, lifestyle, infections, genetics, healthcare access, screening, lifespan, reporting quality).",
+        transform=footer_ax.transAxes, fontsize=7.8, va='top', color='#444444')
+    footer_ax.text(0.015, 0.36,
+        "Cancer data: IARC CI5-XII period-average (2013-2017), matching Panel D's correlation dataset.",
+        transform=footer_ax.transAxes, fontsize=7.8, va='top', color='#444444')
+    footer_ax.text(0.015, 0.14,
+        f"Using GLOBOCAN 2024 single-year estimates instead yields a materially identical correlation "
+        f"(r={CURRENT_STATS['globocan_r']:.2f}, p={CURRENT_STATS['globocan_p']:.1e}, n={CURRENT_STATS['globocan_n']} "
+        f"vs period-average r={CURRENT_STATS['raw_r']:.2f}, p={CURRENT_STATS['raw_p']:.1e}, n={CURRENT_STATS['raw_n']}; Supplementary Table S2).",
+        transform=footer_ax.transAxes, fontsize=7.8, va='top', color='#444444')
+
+    plt.savefig('Figure2_full.pdf', bbox_inches='tight', facecolor='white')
+    plt.savefig('Figure2_full.png', dpi=200, bbox_inches='tight', facecolor='white')
+    print(f"Saved Figure2_full.pdf/.png. Raw correlation: r={r:.3f}, p={p:.3g}, n={len(corr_df)}")
